@@ -1,0 +1,515 @@
+Architecture Document - FPGA Market Data Parser
+
+-Document generated with Claude.
+
+---------------------------------------------------------------
+1. Overview
+
+1.1 Purpose
+This document describes the architecture of a low-latency FPGA-based market data parser designed for high-frequency trading (HFT) applications. The initial implementation targets NASDAQ ITCH 5.0 protocol with extensibility for FIX and other protocols.
+
+1.2 Design Goals
+- **Ultra-low latency**: Sub-microsecond message parsing (target: 5-10 clock cycles)
+- **High throughput**: Handle 1M+ messages/second sustained
+- **Deterministic**: Fixed-latency pipeline, no stalls
+- **Extensible**: Modular design for multiple protocols
+- **Resource efficient**: Minimize FPGA resource usage
+
+1.3 Target Platforms
+- TBD
+
+---------------------------------------------------------------
+
+2. System Architecture
+
+2.1 High-Level Block Diagram
+
+┌─────────────────────────────────────────────────────────────┐
+│                     Network Interface                       │
+│              (MAC/PHY, UDP/TCP Offload)                     │
+└──────────────────────┬──────────────────────────────────────┘
+                       │ AXI-Stream
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│                  Packet Preprocessor                        │
+│         (Timestamp Injection, Alignment, Buffering)         │
+└──────────────────────┬──────────────────────────────────────┘
+                       │ AXI-Stream (64-bit aligned)
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│                 Protocol Demultiplexer                      │
+│              (Route to protocol-specific parser)            │
+└──────┬────────────────┬────────────────┬────────────────────┘
+       │                │                │
+       │ ITCH           │ FIX            │ Future protocols
+       ▼                ▼                ▼
+┌─────────────┐  ┌─────────────┐  ┌─────────────┐
+│ITCH Parser  │  │ FIX Parser  │  │   Reserved  │
+│   Module    │  │   Module    │  │             │
+└──────┬──────┘  └──────┬──────┘  └─────────────┘
+       │                │
+       └────────┬───────┘
+                ▼
+┌─────────────────────────────────────────────────────────────┐
+│              Message Output Interface                       │
+│         (Normalized format, FIFO, AXI-Stream)               │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│          Downstream Logic (Order Book, Signals)             │
+└─────────────────────────────────────────────────────────────┘
+
+
+2.2 Data Flow
+
+1. **Ingress**: Network packets arrive via 10G/40G Ethernet
+2. **Preprocessing**: Timestamp injection, protocol header stripping
+3. **Demux**: Route based on protocol identifier or port
+4. **Parsing**: Protocol-specific state machines extract fields
+5. **Normalization**: Convert to internal canonical format
+6. **Output**: Stream to downstream trading logic
+
+---------------------------------------------------------------
+
+3. Module Specifications
+
+3.1 Packet Preprocessor
+
+**Purpose**: Prepare raw network data for parsing
+
+**Inputs**:
+- `axis_rx_tdata` [63:0] - Incoming packet data (AXI-Stream)
+- `axis_rx_tvalid` - Data valid signal
+- `axis_rx_tlast` - End of packet
+- `axis_rx_tkeep` [7:0] - Byte enable
+
+**Outputs**:
+- `pp_tdata` [63:0] - Preprocessed data
+- `pp_tvalid` - Valid signal
+- `pp_timestamp` [63:0] - Hardware timestamp (nanoseconds)
+- `pp_protocol_id` [7:0] - Protocol identifier
+
+**Functions**:
+- Inject hardware timestamp at packet arrival
+- Strip Ethernet/IP/UDP headers (optional)
+- Align data to message boundaries
+- Buffer partial messages across packet boundaries
+- Detect protocol from port number or pattern matching
+
+**Latency**: 2-3 cycles
+
+**Resources**:
+- Small FIFO (512 bytes) for boundary buffering
+- Timestamp counter (free-running)
+- Header offset registers
+
+
+3.2 ITCH Parser Module
+
+**Purpose**: Parse NASDAQ ITCH 5.0 binary messages
+
+3.2.1 Architecture
+
+┌──────────────────────────────────────────────────────────┐
+│                    ITCH Parser Top                       │
+│                                                          │
+│  ┌─────────────────────────────────────────────────┐     │
+│  │         Message Type Decoder (Stage 1)          │     │
+│  │  - Read byte 0                                  │     │
+│  │  - Lookup message length                        │     │
+│  │  - Route to parser                              │     │
+│  └──────────────┬──────────────────────────────────┘     │
+│                 │                                        │
+│     ┌───────────┼───────────┬──────────┬─────────┐       │
+│     ▼           ▼           ▼          ▼         ▼       │
+│  ┌─────┐   ┌──────┐   ┌────────┐  ┌──────┐  ┌─────┐      │
+│  │ Add │   │ Exec │   │ Cancel │  │Delete│  │Trade│      │
+│  │Order│   │Order │   │ Order  │  │Order │  │ Msg │      │
+│  │  A  │   │  E/C │   │   X    │  │  D   │  │ P/Q │      │
+│  └──┬──┘   └───┬──┘   └────┬───┘  └───┬──┘  └──┬──┘      │
+│     └──────────┼───────────┼──────────┼────────┘         │
+│                ▼                                         │
+│  ┌─────────────────────────────────────────────────┐     │
+│  │      Field Extraction & Endian Convert          │     │
+│  │           (Stage 2-3)                           │     │
+│  └──────────────┬──────────────────────────────────┘     │
+│                 ▼                                        │
+│  ┌─────────────────────────────────────────────────┐     │
+│  │         Output Formatter (Stage 4)              │     │
+│  └──────────────┬──────────────────────────────────┘     │
+└─────────────────┼────────────────────────────────────────┘
+                  ▼
+          Parsed Message Output
+
+
+3.2.2 Pipeline Stages
+
+**Stage 1: Message Type Decode (1 cycle)**
+- Read message type from byte 0
+- Lookup message length from ROM
+- Generate control signals for field extraction
+
+**Stage 2: Field Extraction (2 cycles)**
+- Extract fields at fixed offsets using parallel slicing
+- Example for 'A' (Add Order):
+  - Stock Locate: bytes [1:2]
+  - Timestamp: bytes [5:10]
+  - Order Ref: bytes [11:18]
+  - Buy/Sell: byte [19]
+  - Shares: bytes [20:23]
+  - Stock: bytes [24:31]
+  - Price: bytes [32:35]
+
+**Stage 3: Endian Conversion (1 cycle)**
+- Convert big-endian fields to little-endian
+- Parallel byte swapping using bit reversal
+
+**Stage 4: Output Formation (1 cycle)**
+- Assemble normalized output structure
+- Set message valid signal
+- Forward to output FIFO
+
+**Total Latency: 5 cycles**
+
+3.2.3 Message Type ROM
+
+```systemverilog
+// Message type -> length mapping
+case (msg_type)
+    8'h53: length = 12;  // 'S' System Event
+    8'h52: length = 39;  // 'R' Stock Directory
+    8'h48: length = 25;  // 'H' Trading Action
+    8'h41: length = 36;  // 'A' Add Order
+    8'h46: length = 40;  // 'F' Add Order MPID
+    8'h45: length = 31;  // 'E' Order Executed
+    8'h43: length = 36;  // 'C' Order Executed w/ Price
+    8'h58: length = 23;  // 'X' Order Cancel
+    8'h44: length = 19;  // 'D' Order Delete
+    8'h55: length = 35;  // 'U' Order Replace
+    8'h50: length = 44;  // 'P' Trade
+    8'h51: length = 40;  // 'Q' Cross Trade
+    8'h42: length = 19;  // 'B' Broken Trade
+    default: length = 0; // Unknown/Invalid
+endcase
+```
+
+3.2.4 Output Format
+
+```
+Normalized ITCH Message Structure (256 bits):
+[255:248] Message Type
+[247:240] Message Flags (valid, error, etc.)
+[239:176] Timestamp (64-bit)
+[175:112] Order Reference Number (64-bit)
+[111:80]  Price (32-bit, fixed point)
+[79:48]   Shares (32-bit)
+[47:16]   Stock Symbol (32-bit, packed ASCII)
+[15:8]    Buy/Sell Indicator
+[7:0]     Reserved
+```
+
+---
+
+3.3 FIX Parser Module
+
+**Purpose**: Parse FIX 4.2/4.4 ASCII messages
+
+3.3.1 Challenges
+- Variable-length, ASCII tag=value format
+- SOH (0x01) delimiter
+- Requires state machine for sequential parsing
+- Checksum validation
+
+3.3.2 Architecture
+
+```
+Input Buffer → Tag Parser → Value Extractor → 
+Field Accumulator → Checksum Validator → Output
+```
+
+**Approach**:
+- Parallel tag scanner (search for '=' and SOH)
+- Lookup table for tag → field mapping
+- ASCII to binary conversion for numeric fields
+- Accumulate fields until complete message
+
+**Latency**: 20-50 cycles (variable, depends on message size)
+
+**Note**: FIX is significantly slower than ITCH due to:
+- Variable length
+- ASCII parsing
+- Sequential scanning
+- Checksum calculation
+
+---
+
+3.4 Protocol Demultiplexer
+
+**Purpose**: Route incoming data to appropriate parser
+
+**Method 1: Port-Based**
+- UDP port 26477 → ITCH parser
+- TCP port 4000-4010 → FIX parser
+
+**Method 2: Pattern-Based**
+- Detect "8=FIX" at start → FIX parser
+- Binary pattern → ITCH parser
+
+**Implementation**: Simple combinatorial logic or small state machine
+
+**Latency**: 1 cycle
+
+---------------------------------------------------------------
+
+4. Interface Specifications
+
+4.1 Input Interface (AXI-Stream)
+
+```systemverilog
+interface axis_input;
+    logic [63:0] tdata;   // Data
+    logic [7:0]  tkeep;   // Byte enables
+    logic        tvalid;  // Valid signal
+    logic        tlast;   // End of packet
+    logic        tready;  // Backpressure
+    logic [15:0] tuser;   // Metadata (optional)
+endinterface
+```
+
+4.2 Parsed Message Output
+
+```systemverilog
+typedef struct packed {
+    logic [7:0]   msg_type;      // Message type
+    logic         valid;         // Message valid
+    logic         error;         // Parse error
+    logic [63:0]  timestamp;     // Hardware timestamp
+    logic [63:0]  order_ref;     // Order reference
+    logic [31:0]  price;         // Price (fixed point)
+    logic [31:0]  shares;        // Quantity
+    logic [63:0]  stock;         // Stock symbol (ASCII)
+    logic         buy_sell;      // 0=sell, 1=buy
+    logic [15:0]  stock_locate;  // Security ID
+} parsed_message_t;
+```
+
+4.3 Control/Status Registers
+
+**Control Registers** (write):
+- `CTRL_ENABLE` [0]: Global enable
+- `CTRL_PROTOCOL_MASK` [7:0]: Enable/disable specific protocols
+- `CTRL_TIMESTAMP_OFFSET` [63:0]: Timestamp calibration
+
+**Status Registers** (read):
+- `STAT_MSG_COUNT` [31:0]: Total messages parsed
+- `STAT_ERROR_COUNT` [31:0]: Parse errors
+- `STAT_OVERFLOW_COUNT` [31:0]: FIFO overflows
+- `STAT_LATENCY_MIN/MAX/AVG` [15:0]: Latency statistics
+
+---------------------------------------------------------------
+
+5. Resource Estimation
+
+5.1 ITCH Parser (Xilinx UltraScale+)
+
+| Resource | Estimated Usage | Notes |
+|----------|----------------|-------|
+| LUTs | 2,000-3,000 | Field extraction, muxing |
+| FFs | 1,500-2,500 | Pipeline registers |
+| BRAM | 1-2 blocks | Message type ROM, buffering |
+| DSP | 0 | Not needed for parsing |
+
+5.2 Complete System
+
+| Resource | Estimated Usage |
+|----------|----------------|
+| LUTs | 8,000-12,000 |
+| FFs | 6,000-10,000 |
+| BRAM | 10-20 blocks |
+| Total Area | <5% of XCU250 |
+
+---------------------------------------------------------------
+
+6. Timing and Performance
+
+6.1 Latency Budget (250 MHz, 4ns/cycle)
+
+| Stage | Cycles | Time (ns) |
+|-------|--------|-----------|
+| Packet preprocessor | 3 | 12 |
+| Protocol demux | 1 | 4 |
+| ITCH parser | 5 | 20 |
+| Output buffering | 1 | 4 |
+| **Total** | **10** | **40** |
+
+6.2 Throughput
+
+**ITCH Messages**:
+- Minimum message: 12 bytes (System Event)
+- Average message: ~30 bytes
+- At 250 MHz, 64-bit datapath: 2 GB/s
+- Theoretical max: ~60M messages/second (small messages)
+- Practical sustained: 5-10M messages/second
+
+**Bottlenecks**:
+- Network bandwidth (10G = 1.25 GB/s)
+- Downstream processing (order book updates)
+
+---------------------------------------------------------------
+
+7. Error Handling
+
+7.1 Error Detection
+
+- **Invalid message type**: Unknown type byte
+- **Length mismatch**: Packet ends mid-message
+- **Timestamp anomaly**: Backwards-moving time
+- **Checksum failure**: (FIX only)
+
+7.2 Error Reporting
+
+- Set error flag in output message
+- Increment error counter in status register
+- Optional: Generate interrupt or error packet
+
+7.3 Recovery Strategy
+
+- Drop invalid message
+- Continue processing next message
+- Log error details to debug buffer
+- No pipeline stalls (drop and move on)
+
+---------------------------------------------------------------
+8. Testing Strategy
+
+8.1 Unit Tests
+
+**Per-Module Testbenches**:
+- ITCH parser: Feed known message sequences
+- Endian converter: Verify byte swapping
+- Field extractor: Check all message types
+
+**Test Vectors**:
+- Valid messages (all types)
+- Boundary conditions (min/max values)
+- Malformed messages
+- Back-to-back messages
+
+8.2 Integration Tests
+
+- Full system simulation with PCAP replay
+- Multi-protocol scenarios
+- High throughput stress tests (millions of messages)
+- Latency measurement with known timestamps
+
+8.3 Hardware Verification
+
+- Loopback tests with traffic generator
+- Compare against software reference parser
+- Measure actual latency with oscilloscope
+- Sustained throughput tests
+
+---------------------------------------------------------------
+
+9. Design Trade-offs
+
+9.1 Parallelism vs Resources
+
+**Current approach**: Sequential pipeline
+- **Pros**: Resource efficient, simple control
+- **Cons**: Limited to one message per N cycles
+
+**Alternative**: Parallel message processing
+- Parse multiple messages simultaneously
+- Requires duplicate parsers (Nx resources)
+- Useful only if network > parser throughput
+
+**Decision**: Start sequential, optimize if needed
+
+9.2 Buffering Strategy
+
+**Minimal buffering** (current):
+- Small FIFOs for boundary alignment
+- Rely on backpressure to network
+
+**Deep buffering** (alternative):
+- Large FIFOs absorb bursts
+- Hide downstream stalls
+- More resources, potentially more latency
+
+**Decision**: Minimal for lowest latency
+
+9.3 Message Filtering
+
+**Option**: Add configurable filters
+- Skip unwanted message types
+- Filter by stock symbol
+- Reduce downstream load
+
+**Trade-off**: Adds latency (lookup) but saves bandwidth
+
+**Decision**: Optional, configurable
+
+---------------------------------------------------------------
+
+10. Future Enhancements
+
+10.1 Phase 2 Features
+
+- [ ] CME MDP 3.0 parser
+- [ ] Multiple ITCH streams in parallel
+- [ ] Hardware order book reconstruction
+- [ ] Message compression/decompression
+- [ ] Hardware timestamp synchronization (PTP)
+
+10.2 Phase 3 Features
+
+- [ ] Machine learning signal generation
+- [ ] Full tick-to-trade pipeline
+- [ ] Multi-FPGA scaling
+- [ ] Nanosecond-precision latency optimization
+
+---------------------------------------------------------------
+
+11. References
+
+- NASDAQ ITCH 5.0 Specification
+- AXI4-Stream Protocol Specification (Xilinx PG085)
+- FIX Protocol Specification 4.2/4.4
+- Xilinx UltraScale+ Architecture User Guide
+
+---
+
+## Appendix A: Message Priority
+
+For implementation order:
+
+**Critical (implement first)**:
+1. 'A' - Add Order (most common)
+2. 'E' - Order Executed
+3. 'X' - Order Cancel
+4. 'D' - Order Delete
+
+**Important**:
+5. 'U' - Order Replace
+6. 'C' - Order Executed w/ Price
+7. 'P' - Trade Message
+
+**Nice to have**:
+8. 'S' - System Event
+9. 'R' - Stock Directory
+10. 'H' - Trading Action
+
+**Later**:
+- Cross trades, NOII, LULD, etc.
+
+---
+
+## Document History
+
+| Version | Date | Author | Changes |
+|---------|------|--------|---------|
+| 1.0 | 2025-10-31 | Initial | Initial architecture document |
+
+---
